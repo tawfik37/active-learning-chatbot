@@ -1,0 +1,12 @@
+torch
+unsloth
+transformers
+datasets
+trl
+pandas
+google-api-python-client
+accelerate
+bitsandbytes
+peft
+sentencepiece
+python-dotenv
