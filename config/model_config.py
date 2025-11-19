@@ -30,7 +30,7 @@ NUM_SAMPLES_NEW = 500    # Samples for "outdated" facts (to force learning)
 
 # Model Training Settings
 MAX_SEQ_LENGTH = 512
-DTYPE = torch.bfloat16
+DTYPE = torch.float16
 LOAD_IN_4BIT = False
 NUM_EPOCHS = 4
 BATCH_SIZE = 4
@@ -52,8 +52,8 @@ GRADIENT_ACCUMULATION_STEPS = 4
 WARMUP_STEPS = 10
 MAX_STEPS = 60
 LEARNING_RATE = 5e-5
-FP16 = not torch.cuda.is_bf16_supported()
-BF16 = torch.cuda.is_bf16_supported()
+FP16 = True
+BF16 = False
 LOGGING_STEPS = 100
 OPTIM = "adamw_8bit"
 WEIGHT_DECAY = 0.01
