@@ -62,7 +62,22 @@ GOOGLE_CSE_ID=your-custom-search-engine-id-here
 
 **IMPORTANT:** The `.env` file is in `.gitignore` and will NOT be committed to git. Never commit your API keys!
 
-### 3. Run the Complete Pipeline
+### 3. Interactive Validation (Manual Mode)
+
+```bash
+!python run_interactive_validation.py
+```
+
+What it does:
+- Prompts you to enter 10 questions manually.
+- Validates each answer against Google Search in real-time.
+- Automatic Trigger:
+  - If the model gets 9 or more correct: It passes (no training needed).
+  - If the model gets 8 or fewer correct: It automatically triggers the fine-tuning pipeline to learn from your new questions.
+
+
+
+## Run the Complete Pipeline
 
 ```bash
 ./start_pipeline.sh
