@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active Learning Chatbot</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <h1>🤖 Active Learning Chatbot</h1>
+            <p class="subtitle">Intelligent chatbot that continuously learns from validation</p>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <div class="container main-container">
+        
+        <!-- Status Bar -->
+        <div class="status-bar" id="statusBar">
+            <div class="status-item">
+                <span class="status-label">API Status:</span>
+                <span class="status-value" id="apiStatus">Checking...</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Model:</span>
+                <span class="status-value" id="modelVersion">Loading...</span>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('chat')">💬 Chat</button>
+            <button class="tab-button" onclick="switchTab('validate')">✅ Validate</button>
+            <button class="tab-button" onclick="switchTab('train')">🎓 Train</button>
+            <button class="tab-button" onclick="switchTab('settings')">⚙️ Settings</button>
+        </div>
+
+        <!-- Chat Tab -->
+        <div id="chatTab" class="tab-content active">
+            <div class="chat-container">
+                <div class="messages" id="messages">
+                    <div class="message bot">
+                        <div class="message-content">
+                            <strong>Bot:</strong> Hi! I'm your active learning chatbot. Ask me anything!
+                        </div>
+                    </div>
+                </div>
+                <div class="input-container">
+                    <input 
+                        type="text" 
+                        id="questionInput" 
+                        placeholder="Ask a question..." 
+                        onkeypress="handleKeyPress(event)"
+                    >
+                    <button onclick="askQuestion()" class="send-button">Send</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Validate Tab -->
+        <div id="validateTab" class="tab-content">
+            <div class="form-container">
+                <h2>Validate an Answer</h2>
+                <p class="description">Check if the model's answer is accurate against web sources</p>
+                
+                <div class="form-group">
+                    <label for="validateQuestion">Question:</label>
+                    <input 
+                        type="text" 
+                        id="validateQuestion" 
+                        placeholder="e.g., Who is the current US president?"
+                    >
+                </div>
+                
+                <div class="form-group">
+                    <label for="validateAnswer">Model's Answer:</label>
+                    <input 
+                        type="text" 
+                        id="validateAnswer" 
+                        placeholder="e.g., Donald Trump"
+                    >
+                </div>
+                
+                <button onclick="validateAnswer()" class="primary-button">Validate</button>
+                
+                <div id="validationResult" class="result-container"></div>
+            </div>
+        </div>
+
+        <!-- Train Tab -->
+        <div id="trainTab" class="tab-content">
+            <div class="form-container">
+                <h2>Train on New Facts</h2>
+                <p class="description">Add new facts for the model to learn</p>
+                
+                <div id="trainingFacts">
+                    <div class="training-fact">
+                        <div class="form-group">
+                            <label>Question:</label>
+                            <input 
+                                type="text" 
+                                class="train-question" 
+                                placeholder="e.g., What is the latest iPhone?"
+                            >
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Answer:</label>
+                            <input 
+                                type="text" 
+                                class="train-answer" 
+                                placeholder="e.g., iPhone 16"
+                            >
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" class="train-stable">
+                                This is a stable fact (won't change)
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                
+                <button onclick="addTrainingFact()" class="secondary-button">+ Add Another Fact</button>
+                <button onclick="startTraining()" class="primary-button">Start Training</button>
+                
+                <div id="trainingResult" class="result-container"></div>
+            </div>
+        </div>
+
+        <!-- Settings Tab -->
+        <div id="settingsTab" class="tab-content">
+            <div class="form-container">
+                <h2>Settings</h2>
+                
+                <div class="form-group">
+                    <label for="apiUrl">API URL:</label>
+                    <input 
+                        type="text" 
+                        id="apiUrl" 
+                        placeholder="https://your-username--active-learning-chatbot-fastapi-app.modal.run"
+                    >
+                    <small>Your Modal deployment URL</small>
+                </div>
+                
+                <button onclick="saveSettings()" class="primary-button">Save Settings</button>
+                <button onclick="testConnection()" class="secondary-button">Test Connection</button>
+                
+                <div id="settingsResult" class="result-container"></div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>Powered by Modal, Qwen2.5, and Active Learning</p>
+        </div>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>
+
+
