@@ -1,521 +1,385 @@
 #!/usr/bin/env python3
 """
 Modal Deployment: Active Learning Chatbot
-Production-ready deployment with FastAPI endpoints, volume storage, and background training
+Production-ready deployment that runs the 'run_interactive_validation.py' cycle silently.
+Fully integrated with config/model_config.py but with SMART GPU DETECTION.
 """
 
 import modal
 import os
+import sys
 import json
+import shutil
+import torch
+import pandas as pd
 from pathlib import Path
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # ============================================================================
-# MODAL CONFIGURATION
+# MODAL SETUP & IMAGE
 # ============================================================================
 
 app = modal.App("active-learning-chatbot")
 volume = modal.Volume.from_name("chatbot-models", create_if_missing=True)
-VOLUME_PATH = "/models"
 
-secrets = [
-    modal.Secret.from_name("google-api-credentials")
-]
+# Define paths relative to the container root
+REMOTE_CONFIG_PATH = "/root/config"
+REMOTE_SRC_PATH = "/root/src"
+REMOTE_FRONTEND_PATH = "/root/frontend"
+VOLUME_MOUNT_PATH = "/models" 
 
-# ============================================================================
-# DOCKER IMAGE CONFIGURATION
-# ============================================================================
-
+# Image definition
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "torch",
-        "transformers",
-        "datasets",
-        "trl",
-        "pandas",
-        "google-api-python-client",
-        "accelerate",
-        "bitsandbytes",
-        "peft",
-        "sentencepiece",
-        "python-dotenv",
-        "fastapi[standard]",
-        "pydantic",
-        "unsloth",
+        "torch", "transformers", "datasets", "trl", "pandas",
+        "google-api-python-client", "accelerate", "bitsandbytes",
+        "peft", "sentencepiece", "python-dotenv", "fastapi[standard]", 
+        "unsloth"
     )
-    .add_local_dir("deployment/frontend", "/root/frontend")
-
+    # MOUNT LOCAL DIRECTORIES
+    .add_local_dir("src", REMOTE_SRC_PATH)
+    .add_local_dir("config", REMOTE_CONFIG_PATH)
+    .add_local_dir("deployment/frontend", REMOTE_FRONTEND_PATH)
 )
 
 # ============================================================================
-# CONFIGURATION CONSTANTS
-# ============================================================================
-
-BASE_MODEL_ID = "unsloth/Qwen2.5-1.5B-Instruct"
-MODEL_SAVE_PREFIX = "qwen-finetuned-v"
-LATEST_MODEL_CONFIG_FILE = "_latest_model_config.json"
-
-MAX_SEQ_LENGTH = 512
-GENERATION_MAX_NEW_TOKENS = 50
-GENERATION_TEMPERATURE = 0.0
-NUM_SAMPLES_STABLE = 100
-NUM_SAMPLES_NEW = 500
-
-NUM_EPOCHS = 4
-BATCH_SIZE = 4
-LEARNING_RATE = 5e-5
-LORA_R = 16
-LORA_ALPHA = 32
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def get_current_model_path(volume_path: str = VOLUME_PATH) -> str:
-    """Get the path to the current/latest model"""
-    config_file = os.path.join(volume_path, LATEST_MODEL_CONFIG_FILE)
-    
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, 'r') as f:
-                config = json.load(f)
-            return config.get("latest_model_path", BASE_MODEL_ID)
-        except:
-            pass
-    
-    return BASE_MODEL_ID
-
-
-def save_model_config(model_path: str, version: int, volume_path: str = VOLUME_PATH):
-    """Save model configuration to volume"""
-    config_file = os.path.join(volume_path, LATEST_MODEL_CONFIG_FILE)
-    config_data = {
-        "latest_model_path": model_path,
-        "latest_version": version
-    }
-    
-    with open(config_file, 'w') as f:
-        json.dump(config_data, f, indent=2)
-
-
-# ============================================================================
-# MODAL FUNCTIONS: INFERENCE
+# TRAINING FUNCTION (Background Job)
 # ============================================================================
 
 @app.function(
     image=image,
-    gpu="T4",
-    volumes={VOLUME_PATH: volume},
-    secrets=secrets,
-    timeout=300,
+    gpu="A10G", # Stronger GPU for training (Auto-switches to BF16)
+    volumes={VOLUME_MOUNT_PATH: volume},
+    timeout=3600
 )
-def generate_answer(question: str) -> dict:
-    """Generate an answer using the current model"""
-    import torch
-    from unsloth import FastLanguageModel
-    
-    model_path = get_current_model_path()
-    print(f"Loading model: {model_path}")
-    
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_path,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=torch.float16,
-        load_in_4bit=False,
-    )
-    FastLanguageModel.for_inference(model)
-    
-    messages = [{"role": "user", "content": question}]
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-    
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=GENERATION_MAX_NEW_TOKENS,
-            temperature=GENERATION_TEMPERATURE,
-            do_sample=False,
-        )
-    
-    generated_ids = outputs[0][len(inputs.input_ids[0]):]
-    answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    
-    return {
-        "answer": answer.strip(),
-        "model_version": model_path
-    }
-
-
-# ============================================================================
-# MODAL FUNCTIONS: VALIDATION
-# ============================================================================
-
-@app.function(
-    image=image,
-    gpu="T4",
-    volumes={VOLUME_PATH: volume},
-    secrets=secrets,
-    timeout=600,
-)
-def validate_answer(question: str, model_answer: str) -> dict:
-    """Validate a model answer against web sources"""
-    import torch
-    from unsloth import FastLanguageModel
-    from googleapiclient.discovery import build
-    
-    google_api_key = os.environ.get("GOOGLE_API_KEY")
-    google_cse_id = os.environ.get("GOOGLE_CSE_ID")
-    
-    if not google_api_key or not google_cse_id:
-        return {
-            "is_outdated": False,
-            "error": "Google API credentials not configured"
-        }
-    
-    # 1. Get web answer
-    try:
-        service = build("customsearch", "v1", developerKey=google_api_key)
-        result = service.cse().list(q=question, cx=google_cse_id, num=3).execute()
-        
-        if 'items' not in result or not result['items']:
-            return {
-                "is_outdated": False,
-                "error": "No web results found"
-            }
-        
-        all_snippets = []
-        for i, item in enumerate(result['items']):
-            snippet = item['snippet'].replace("...", "").strip()
-            all_snippets.append(f"Source {i+1}: {snippet}")
-        
-        web_context = "\n".join(all_snippets)
-        
-    except Exception as e:
-        return {
-            "is_outdated": False,
-            "error": f"Web search failed: {str(e)}"
-        }
-    
-    # 2. Load model for judging
-    model_path = get_current_model_path()
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_path,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=torch.float16,
-        load_in_4bit=False,
-    )
-    FastLanguageModel.for_inference(model)
-    
-    # 3. Extract fact from web
-    prompt_text = (
-        f"You are a fact-checking assistant. Answer the 'Question' based *only* on the 'Context'.\n"
-        f"Output *only* the short, direct answer. If not in context, output: [NO_ANSWER]\n\n"
-        f"--- CONTEXT ---\n{web_context}\n\n"
-        f"--- QUESTION ---\n{question}\n\n"
-        f"--- ANSWER ---\n"
-    )
-    
-    messages = [{"role": "user", "content": prompt_text}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=50, temperature=0.0, do_sample=False)
-    
-    generated_ids = outputs[0][len(inputs.input_ids[0]):]
-    web_fact = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    
-    if "[NO_ANSWER]" in web_fact:
-        return {
-            "is_outdated": False,
-            "web_fact": None,
-            "reason": "Could not extract fact from web"
-        }
-    
-    # 4. Judge if answers match
-    judge_prompt = (
-        f"Does Answer A mean the same thing as Answer B? Answer YES or NO.\n\n"
-        f"A: {model_answer}\n"
-        f"B: {web_fact}\n"
-        f"Answer:"
-    )
-    
-    messages = [{"role": "user", "content": judge_prompt}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=5, temperature=0.0, do_sample=False)
-    
-    generated_ids = outputs[0][len(inputs.input_ids[0]):]
-    decision = tokenizer.decode(generated_ids, skip_special_tokens=True).strip().upper()
-    
-    is_outdated = not decision.startswith("YES")
-    
-    return {
-        "is_outdated": is_outdated,
-        "model_answer": model_answer,
-        "web_fact": web_fact,
-        "web_context": web_context,
-        "judge_decision": decision
-    }
-
-
-# ============================================================================
-# MODAL FUNCTIONS: TRAINING
-# ============================================================================
-
-@app.function(
-    image=image,
-    gpu="A10G",
-    volumes={VOLUME_PATH: volume},
-    secrets=secrets,
-    timeout=3600,
-)
-def train_on_new_facts(training_data: list[dict]) -> dict:
-    """Fine-tune the model on new facts"""
-    import torch
-    from unsloth import FastLanguageModel
-    from datasets import Dataset
+def train_job():
+    """
+    Replicates 'run_training_only.py' but overrides precision settings dynamically.
+    """
+    sys.path.append("/root") 
+    from unsloth import FastLanguageModel, is_bfloat16_supported
     from trl import SFTTrainer
     from transformers import TrainingArguments
-    
-    print(f"Starting training with {len(training_data)} facts")
-    
-    # Prepare training samples
-    formatted_samples = []
-    for item in training_data:
-        question = item['question']
-        answer = item['answer']
-        is_stable = item.get('is_stable', False)
-        num_samples = NUM_SAMPLES_STABLE if is_stable else NUM_SAMPLES_NEW
-        
-        for _ in range(num_samples):
-            text = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>"
-            formatted_samples.append({"text": text})
-    
-    dataset = Dataset.from_list(formatted_samples)
-    
-    # Load base model
+    from datasets import Dataset
+    import config.model_config as cfg 
+
+    print("\n" + "="*80)
+    print("🏋️ TRAINING JOB STARTED")
+    print("="*80)
+
+    # 1. Resolve Paths
+    data_file = os.path.join(VOLUME_MOUNT_PATH, cfg.DATA_FOR_FINETUNING_FILE)
+    config_file = os.path.join(VOLUME_MOUNT_PATH, cfg.LATEST_MODEL_CONFIG_FILE)
+
+    # 2. Check & Load Data
+    volume.reload()
+    if not os.path.exists(data_file):
+        print(f"❌ No training data found at {data_file}. Aborting.")
+        return
+
+    try:
+        df = pd.read_json(data_file, lines=True)
+        dataset = Dataset.from_pandas(df[["text"]])
+        print(f"✅ Loaded {len(dataset)} samples from {data_file}")
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        return
+
+    # 3. Determine Base Model & Version
+    if os.path.exists(config_file):
+        try:
+            with open(config_file) as f: saved_cfg = json.load(f)
+            base_path = saved_cfg.get("latest_model_path", cfg.BASE_MODEL_ID)
+            prev_ver = saved_cfg.get("latest_version", 0)
+        except:
+            base_path = cfg.BASE_MODEL_ID
+            prev_ver = 0
+    else:
+        base_path = cfg.BASE_MODEL_ID
+        prev_ver = 0
+
+    print(f"🔄 Fine-tuning on top of: {base_path} (v{prev_ver})")
+
+    # 4. Load Model
+    # FIX: We use dtype=None to let Unsloth automatically pick FP16 (T4) or BF16 (A10G)
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL_ID,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=torch.float16,
-        load_in_4bit=False,
+        model_name=base_path,
+        max_seq_length=cfg.MAX_SEQ_LENGTH,
+        load_in_4bit=cfg.LOAD_IN_4BIT,
+        dtype=None, 
     )
     
-    # Setup LoRA
+    # 5. Apply LoRA
     model = FastLanguageModel.get_peft_model(
         model,
-        r=LORA_R,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
+        r=cfg.LORA_R,
+        target_modules=cfg.LORA_TARGET_MODULES,
+        lora_alpha=cfg.LORA_ALPHA,
+        lora_dropout=cfg.LORA_DROPOUT,
+        bias=cfg.LORA_BIAS,
+        use_gradient_checkpointing=cfg.USE_GRADIENT_CHECKPOINTING,
     )
-    
-    # Train
-    training_args = TrainingArguments(
-        output_dir="/tmp/training-output",
-        per_device_train_batch_size=BATCH_SIZE,
-        num_train_epochs=NUM_EPOCHS,
-        learning_rate=LEARNING_RATE,
-        logging_steps=100,
-        save_strategy="no",
-        fp16=True,
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="linear",
-        warmup_steps=10,
-        report_to="none",
-    )
-    
+
+    # 6. Train with DYNAMIC PRECISION
+    # FIX: We calculate support dynamically instead of trusting the config file
+    supports_bf16 = is_bfloat16_supported()
+    print(f"⚙️ GPU Support: BF16={supports_bf16}. Overriding config precision settings.")
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
         dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
-        args=training_args,
-        packing=False,
+        max_seq_length=cfg.MAX_SEQ_LENGTH,
+        args=TrainingArguments(
+            output_dir="/tmp/out", 
+            per_device_train_batch_size=cfg.BATCH_SIZE, 
+            num_train_epochs=cfg.NUM_EPOCHS, 
+            learning_rate=cfg.LEARNING_RATE, 
+            
+            # --- DYNAMIC OVERRIDE ---
+            fp16 = not supports_bf16,
+            bf16 = supports_bf16,
+            # ------------------------
+            
+            logging_steps=cfg.LOGGING_STEPS,
+            optim=cfg.OPTIM,
+            weight_decay=cfg.WEIGHT_DECAY,
+            lr_scheduler_type=cfg.LR_SCHEDULER_TYPE,
+            save_strategy="no",
+            report_to="none"
+        )
     )
-    
     trainer.train()
+
+    # 7. Save New Version
+    new_ver = prev_ver + 1
+    new_model_dir_name = f"{cfg.MODEL_SAVE_PREFIX}{new_ver}"
+    new_path = os.path.join(VOLUME_MOUNT_PATH, new_model_dir_name)
     
-    # Save model
-    config_file = os.path.join(VOLUME_PATH, LATEST_MODEL_CONFIG_FILE)
-    if os.path.exists(config_file):
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-        last_version = config.get("latest_version", 0)
-    else:
-        last_version = 0
+    model.save_pretrained_merged(new_path, tokenizer, save_method="merged_16bit")
     
-    new_version = last_version + 1
-    new_model_path = os.path.join(VOLUME_PATH, f"{MODEL_SAVE_PREFIX}{new_version}")
+    # 8. Update Config
+    with open(config_file, 'w') as f:
+        json.dump({"latest_model_path": new_path, "latest_version": new_ver}, f)
     
-    model.save_pretrained_merged(
-        new_model_path,
-        tokenizer,
-        save_method="merged_16bit",
-    )
-    
-    save_model_config(new_model_path, new_version)
+    # 9. Archive Data
+    if os.path.exists(data_file):
+        shutil.move(data_file, f"{data_file}.processed_v{new_ver}")
+
     volume.commit()
-    
-    return {
-        "success": True,
-        "model_path": new_model_path,
-        "version": new_version,
-        "training_samples": len(dataset)
-    }
-
+    print(f"✅ TRAINING COMPLETE. Saved v{new_ver} to {new_path}")
+    return {"status": "success", "new_version": new_ver}
 
 # ============================================================================
-# FASTAPI WEB APPLICATION
+# MODEL SERVING CLASS (Chat & Validation)
 # ============================================================================
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
-
-
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = Path("/root/frontend")
-
-web_app = FastAPI(
-    title="Active Learning Chatbot",
-    description="Intelligent chatbot with integrated web interface",
-    version="1.0.0"
+@app.cls(
+    image=image,
+    gpu="T4", # T4 is cheaper for inference
+    volumes={VOLUME_MOUNT_PATH: volume},
+    secrets=[modal.Secret.from_name("google-api-credentials")],
+    timeout=900,
+    scaledown_window=300,
+    max_containers=10,
+    min_containers=1 
 )
+class ModelService:
+    cycle_count: int = 0
+    correct_answers: int = 0
+    
+    def _get_config_module(self):
+        if "/root" not in sys.path: sys.path.append("/root")
+        import config.model_config as cfg
+        return cfg
 
+    def get_latest_model_info(self, cfg):
+        volume.reload()
+        config_file = os.path.join(VOLUME_MOUNT_PATH, cfg.LATEST_MODEL_CONFIG_FILE)
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f: saved = json.load(f)
+                return saved.get("latest_model_path", cfg.BASE_MODEL_ID), saved.get("latest_version", 0)
+            except: pass
+        return cfg.BASE_MODEL_ID, 0
+
+    @modal.enter()
+    def initialize(self):
+        from unsloth import FastLanguageModel
+        cfg = self._get_config_module()
+        
+        self.current_model_path, self.current_version = self.get_latest_model_info(cfg)
+        
+        print(f"🔄 Initializing Model: {self.current_model_path} (v{self.current_version})")
+        
+        # FIX: dtype=None allows auto-detection (T4->FP16, A10G->BF16)
+        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+            model_name=self.current_model_path,
+            max_seq_length=cfg.MAX_SEQ_LENGTH,
+            dtype=None, 
+            load_in_4bit=cfg.LOAD_IN_4BIT,
+        )
+        FastLanguageModel.for_inference(self.model)
+        
+        self.cycle_count = 0
+        self.correct_answers = 0
+        
+        # Cleanup old data
+        data_file = os.path.join(VOLUME_MOUNT_PATH, cfg.DATA_FOR_FINETUNING_FILE)
+        if os.path.exists(data_file):
+            os.remove(data_file)
+            volume.commit()
+
+        print("✅ System Ready!")
+
+    def check_and_reload_model(self):
+        cfg = self._get_config_module()
+        latest_path, latest_ver = self.get_latest_model_info(cfg)
+        
+        if latest_ver > self.current_version:
+            print(f"\n🆕 NEW MODEL DETECTED (v{latest_ver}). Reloading...")
+            self.current_model_path = latest_path
+            self.current_version = latest_ver
+            
+            from unsloth import FastLanguageModel
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=self.current_model_path,
+                max_seq_length=cfg.MAX_SEQ_LENGTH,
+                dtype=None, # Auto-detect precision
+                load_in_4bit=cfg.LOAD_IN_4BIT,
+            )
+            FastLanguageModel.for_inference(self.model)
+            
+            self.cycle_count = 0
+            self.correct_answers = 0
+            print(f"✅ Reload Complete! Serving v{latest_ver}")
+
+    def save_to_training_file(self, question, answer, is_stable):
+        cfg = self._get_config_module()
+        data_file = os.path.join(VOLUME_MOUNT_PATH, cfg.DATA_FOR_FINETUNING_FILE)
+        num_samples = cfg.NUM_SAMPLES_STABLE if is_stable else cfg.NUM_SAMPLES_NEW
+        
+        text = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>"
+        entries = [{"text": text} for _ in range(num_samples)]
+        
+        with open(data_file, 'a') as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        volume.commit()
+        print(f"💾 Saved {num_samples} samples (Stable: {is_stable})")
+
+    @modal.method()
+    def generate_answer(self, question: str):
+        # 1. Reload Check
+        cfg = self._get_config_module()
+        self.check_and_reload_model()
+        
+        print("\n" + "-"*50)
+        print(f"❓ User asked: {question}")
+        print(f"📊 Cycle Progress: {self.cycle_count + 1}/10")
+
+        # 2. Generate
+        messages = [{"role": "user", "content": question}]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to("cuda")
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, 
+                max_new_tokens=cfg.GENERATION_MAX_NEW_TOKENS, 
+                temperature=cfg.GENERATION_TEMPERATURE, 
+                do_sample=cfg.GENERATION_DO_SAMPLE
+            )
+        
+        generated_ids = outputs[0][len(inputs.input_ids[0]):]
+        model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        print(f"🤖 Model Answer: {model_answer}")
+
+        # 3. Validation Logic (Hidden)
+        from src.validator.web_search import get_web_answer
+        from src.validator.llm_judge import get_clean_fact_from_web, is_answer_outdated_llm_judge
+        
+        is_correct = True
+        web_context = get_web_answer(question)
+        
+        if web_context:
+            extracted_fact = get_clean_fact_from_web(web_context, question, self.model, self.tokenizer)
+            if "[NO_ANSWER]" not in extracted_fact:
+                is_outdated = is_answer_outdated_llm_judge(model_answer, extracted_fact, self.model, self.tokenizer)
+                if is_outdated:
+                    print(f"❌ RESULT: OUTDATED/INCORRECT -> Saving new fact: {extracted_fact}")
+                    self.save_to_training_file(question, extracted_fact, is_stable=False)
+                    is_correct = False
+                else:
+                    print(f"✅ RESULT: CORRECT/STABLE -> Saving reinforcement.")
+                    self.save_to_training_file(question, model_answer, is_stable=True)
+            else:
+                print("⚠️ Judge Skipped: Fact extraction failed.")
+        else:
+            print("⚠️ Judge Skipped: No web results.")
+
+        # 4. Cycle Logic
+        self.cycle_count += 1
+        if is_correct: self.correct_answers += 1
+            
+        if self.cycle_count >= 10:
+            print(f"\n📊 CYCLE DONE. Score: {self.correct_answers}/10")
+            if self.correct_answers <= 8:
+                print("🚨 SCORE <= 8. TRIGGERING TRAINING...")
+                self.cycle_count = 0 
+                self.correct_answers = 0
+                train_job.spawn()
+            else:
+                print("✅ SCORE > 8. NO TRAINING.")
+                self.cycle_count = 0
+                self.correct_answers = 0
+                data_file = os.path.join(VOLUME_MOUNT_PATH, cfg.DATA_FOR_FINETUNING_FILE)
+                if os.path.exists(data_file):
+                    os.remove(data_file)
+                    volume.commit()
+
+        # 5. Return Answer
+        return {
+            "answer": model_answer,
+            "model_version": f"v{self.current_version}"
+        }
+
+# ============================================================================
+# WEB API
+# ============================================================================
+
+web_app = FastAPI()
+web_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class QuestionRequest(BaseModel):
     question: str
 
-
-class ValidationRequest(BaseModel):
-    question: str
-    model_answer: str
-
-
-class TrainingRequest(BaseModel):
-    training_data: list[dict]
-
-
-# API Endpoints (under /api prefix)
-@web_app.get("/api/health")
-async def health_check():
-    """API health check"""
-    return {
-        "status": "online",
-        "service": "Active Learning Chatbot",
-        "version": "1.0.0"
-    }
-
-
 @web_app.post("/api/chat")
-async def chat(request: QuestionRequest):
-    """Ask the chatbot a question"""
-    try:
-        result = generate_answer.remote(request.question)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def chat(req: QuestionRequest):
+    return ModelService().generate_answer.remote(req.question)
 
-
-@web_app.post("/api/validate")
-async def validate(request: ValidationRequest):
-    """Validate a model answer"""
-    try:
-        result = validate_answer.remote(request.question, request.model_answer)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@web_app.post("/api/train")
-async def train(request: TrainingRequest):
-    """Trigger model training"""
-    try:
-        result = train_on_new_facts.spawn(request.training_data)
-        return {
-            "status": "training_started",
-            "job_id": result.object_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+@web_app.get("/api/health")
+async def health():
+    return {"status": "online"}
 
 @web_app.get("/api/model/current")
-async def get_current_model():
-    """Get current model info"""
-    try:
-        model_path = get_current_model_path()
-        return {
-            "model_path": model_path,
-            "is_base_model": model_path == BASE_MODEL_ID
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def model_info():
+    return {"model_path": "current", "is_base_model": False}
 
+from fastapi.staticfiles import StaticFiles
+web_app.mount("/", StaticFiles(directory="/root/frontend", html=True, check_dir=False))
 
-# Frontend serving
-
-@web_app.get("/", response_class=HTMLResponse)
-async def serve_root():
-    """Serve index.html or fallback if missing"""
-    index_file = FRONTEND_DIR / "index.html"
-    if index_file.exists():
-        return FileResponse(index_file)
-    return HTMLResponse(
-        "<h1>Frontend missing</h1><p>API docs: <a href='/docs'>/docs</a></p>"
-    )
-
-
-@web_app.get("/style.css")
-async def serve_css():
-    css = FRONTEND_DIR / "style.css"
-    if css.exists():
-        return FileResponse(css, media_type="text/css")
-    raise HTTPException(404, "style.css not found")
-
-
-@web_app.get("/app.js")
-async def serve_js():
-    js = FRONTEND_DIR / "app.js"
-    if js.exists():
-        return FileResponse(js, media_type="application/javascript")
-    raise HTTPException(404, "app.js not found")
-
-
-# ============================================================================
-# MODAL ASGI APP WITH STATIC FILE SERVING
-# ============================================================================
-
-@app.function(
-    image=image,
-    secrets=secrets,
-    volumes={VOLUME_PATH: volume},
-)
+@app.function(image=image, secrets=[modal.Secret.from_name("google-api-credentials")])
 @modal.asgi_app()
 def fastapi_app():
-    """Mount FastAPI with frontend static files"""
-    # This will be called by Modal to get the ASGI app
     return web_app
-
-
-@app.local_entrypoint()
-def main(question: str = "What is the capital of France?"):
-    """Test the chatbot from command line"""
-    print(f"\nQuestion: {question}")
-    result = generate_answer.remote(question)
-    print(f"Answer: {result['answer']}")
-    print(f"Model: {result['model_version']}")

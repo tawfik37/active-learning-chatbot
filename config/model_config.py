@@ -41,7 +41,7 @@ LEARNING_RATE = 5e-5
 LORA_R = 16
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj","gate_proj", "up_proj", "down_proj",]
 LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
+LORA_DROPOUT = 0
 LORA_BIAS = "none"
 USE_GRADIENT_CHECKPOINTING = "unsloth"
 
