@@ -34,9 +34,9 @@ VOLUME_MOUNT_PATH = "/models"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "torch", "transformers", "datasets", "trl", "pandas",
+        "torch", "transformers==4.57.1", "datasets", "trl", "pandas",
         "google-api-python-client", "accelerate", "bitsandbytes",
-        "peft", "sentencepiece", "python-dotenv", "fastapi[standard]", 
+        "peft", "sentencepiece", "python-dotenv", "fastapi[standard]",
         "unsloth"
     )
     # MOUNT LOCAL DIRECTORIES
@@ -159,20 +159,37 @@ def train_job():
     new_ver = prev_ver + 1
     new_model_dir_name = f"{cfg.MODEL_SAVE_PREFIX}{new_ver}"
     new_path = os.path.join(VOLUME_MOUNT_PATH, new_model_dir_name)
-    
+
+    print(f"💾 Saving fine-tuned model to {new_path}...")
+
+    # Save the merged model (using transformers 4.57.1 for compatibility)
     model.save_pretrained_merged(new_path, tokenizer, save_method="merged_16bit")
-    
-    # 8. Update Config
+
+    print(f"✅ Model saved successfully")
+
+    # 8. Commit model to volume FIRST (before updating config)
+    print(f"💾 Committing model to volume...")
+    volume.commit()
+    print(f"✅ Model committed to volume")
+
+    # 9. Update Config to point to new model
+    print(f"📝 Updating config to v{new_ver}...")
     with open(config_file, 'w') as f:
         json.dump({"latest_model_path": new_path, "latest_version": new_ver}, f)
-    
-    # 9. Archive Data
+
+    # 10. Archive Data
     if os.path.exists(data_file):
         shutil.move(data_file, f"{data_file}.processed_v{new_ver}")
 
+    # 11. Final commit with config update
     volume.commit()
-    print(f"✅ TRAINING COMPLETE. Saved v{new_ver} to {new_path}")
-    return {"status": "success", "new_version": new_ver}
+
+    print(f"\n" + "="*80)
+    print(f"✅ TRAINING COMPLETE!")
+    print(f"="*80)
+    print(f"   New model: v{new_ver} at {new_path}")
+    print(f"   Inference containers will auto-reload on next request")
+    return {"status": "success", "new_version": new_ver, "model_path": new_path}
 
 # ============================================================================
 # MODEL SERVING CLASS (Chat & Validation)
@@ -186,11 +203,12 @@ def train_job():
     timeout=900,
     scaledown_window=300,
     max_containers=10,
-    min_containers=1 
+    min_containers=1
 )
 class ModelService:
     cycle_count: int = 0
     correct_answers: int = 0
+    is_reloading: bool = False
     
     def _get_config_module(self):
         if "/root" not in sys.path: sys.path.append("/root")
@@ -211,23 +229,43 @@ class ModelService:
     def initialize(self):
         from unsloth import FastLanguageModel
         cfg = self._get_config_module()
-        
+
         self.current_model_path, self.current_version = self.get_latest_model_info(cfg)
-        
+
         print(f"🔄 Initializing Model: {self.current_model_path} (v{self.current_version})")
-        
-        # FIX: dtype=None allows auto-detection (T4->FP16, A10G->BF16)
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.current_model_path,
-            max_seq_length=cfg.MAX_SEQ_LENGTH,
-            dtype=None, 
-            load_in_4bit=cfg.LOAD_IN_4BIT,
-        )
-        FastLanguageModel.for_inference(self.model)
-        
+
+        # Try to load the model with fallback to base model if it fails
+        try:
+            # FIX: dtype=None allows auto-detection (T4->FP16, A10G->BF16)
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=self.current_model_path,
+                max_seq_length=cfg.MAX_SEQ_LENGTH,
+                dtype=None,
+                load_in_4bit=cfg.LOAD_IN_4BIT,
+            )
+            FastLanguageModel.for_inference(self.model)
+            print(f"✅ Successfully loaded model v{self.current_version}")
+
+        except Exception as e:
+            print(f"❌ Error loading model v{self.current_version}: {e}")
+            print(f"⚠️ Falling back to base model: {cfg.BASE_MODEL_ID}")
+
+            # Load base model as fallback
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=cfg.BASE_MODEL_ID,
+                max_seq_length=cfg.MAX_SEQ_LENGTH,
+                dtype=None,
+                load_in_4bit=cfg.LOAD_IN_4BIT,
+            )
+            FastLanguageModel.for_inference(self.model)
+            self.current_model_path = cfg.BASE_MODEL_ID
+            self.current_version = 0
+            print(f"✅ Base model loaded successfully")
+
         self.cycle_count = 0
         self.correct_answers = 0
-        
+        self.is_reloading = False
+
         # Cleanup old data
         data_file = os.path.join(VOLUME_MOUNT_PATH, cfg.DATA_FOR_FINETUNING_FILE)
         if os.path.exists(data_file):
@@ -237,26 +275,64 @@ class ModelService:
         print("✅ System Ready!")
 
     def check_and_reload_model(self):
+        """
+        Hot-swap model reload: Keeps old model running while loading new one.
+        This prevents errors when requests come in during model reload.
+        """
         cfg = self._get_config_module()
         latest_path, latest_ver = self.get_latest_model_info(cfg)
-        
+
         if latest_ver > self.current_version:
-            print(f"\n🆕 NEW MODEL DETECTED (v{latest_ver}). Reloading...")
-            self.current_model_path = latest_path
-            self.current_version = latest_ver
-            
-            from unsloth import FastLanguageModel
-            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-                model_name=self.current_model_path,
-                max_seq_length=cfg.MAX_SEQ_LENGTH,
-                dtype=None, # Auto-detect precision
-                load_in_4bit=cfg.LOAD_IN_4BIT,
-            )
-            FastLanguageModel.for_inference(self.model)
-            
-            self.cycle_count = 0
-            self.correct_answers = 0
-            print(f"✅ Reload Complete! Serving v{latest_ver}")
+            # Prevent concurrent reload attempts
+            if self.is_reloading:
+                print(f"⏳ Model reload already in progress. Using current model v{self.current_version}")
+                return
+
+            print(f"\n🆕 NEW MODEL DETECTED (v{latest_ver}). Starting hot-swap reload...")
+            self.is_reloading = True
+
+            try:
+                # Keep references to old model (still serving requests)
+                old_model = self.model
+                old_tokenizer = self.tokenizer
+                old_version = self.current_version
+
+                print(f"📥 Loading new model v{latest_ver} (old model v{old_version} still serving)...")
+
+                # Load new model in the background
+                from unsloth import FastLanguageModel
+                new_model, new_tokenizer = FastLanguageModel.from_pretrained(
+                    model_name=latest_path,
+                    max_seq_length=cfg.MAX_SEQ_LENGTH,
+                    dtype=None, # Auto-detect precision
+                    load_in_4bit=cfg.LOAD_IN_4BIT,
+                )
+                FastLanguageModel.for_inference(new_model)
+
+                print(f"✅ New model v{latest_ver} loaded successfully!")
+
+                # Atomic swap: Only update references after new model is fully ready
+                self.model = new_model
+                self.tokenizer = new_tokenizer
+                self.current_model_path = latest_path
+                self.current_version = latest_ver
+
+                # Reset counters
+                self.cycle_count = 0
+                self.correct_answers = 0
+
+                print(f"🔄 Hot-swap complete! Now serving v{latest_ver}")
+                print(f"   Old model v{old_version} will be garbage collected")
+
+                # Old model will be garbage collected automatically
+                del old_model
+                del old_tokenizer
+
+            except Exception as e:
+                print(f"❌ Error during model reload: {e}")
+                print(f"⚠️ Continuing with old model v{self.current_version}")
+            finally:
+                self.is_reloading = False
 
     def save_to_training_file(self, question, answer, is_stable):
         cfg = self._get_config_module()
@@ -297,7 +373,6 @@ class ModelService:
         
         generated_ids = outputs[0][len(inputs.input_ids[0]):]
         model_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        print(f"🤖 Model Answer: {model_answer}")
 
         # 3. Validation Logic (Hidden)
         from src.validator.web_search import get_web_answer
