@@ -12,7 +12,6 @@ def get_clean_fact_from_web(context, question, validator_model, validator_tokeni
     Uses a single, robust prompt to find the answer AND validate it.
     Returns the clean fact OR "[NO_ANSWER]" if it's invalid/not found.
     """
-    print(f"--- 1. Extracting and Validating Web Fact (V12)...")
 
     # --- ROBUST PROMPT (V12) ---
     prompt_text = (
@@ -53,8 +52,6 @@ def get_clean_fact_from_web(context, question, validator_model, validator_tokeni
 
     # More robust stripping
     clean_fact = clean_fact.strip().strip('."').strip()
-
-    print(f"   Extracted: '{clean_fact}'")
     return clean_fact
 
 
@@ -63,7 +60,7 @@ def is_answer_outdated_llm_judge(model_answer, extracted_web_fact, validator_mod
     Uses the validator_model itself to judge if the model's answer
     matches the web-extracted fact.
     """
-    print(f"--- 2. Comparing answers (LLM-as-a-Judge)...")
+    print(f"--- 1. Comparing answers (LLM-as-a-Judge)...")
     print(f"Model Answer: '{model_answer}'")
     print(f"Web Fact:     '{extracted_web_fact}'")
 
