@@ -1,6 +1,8 @@
 // Configuration - Auto-detect API URL
 let API_URL = window.location.origin;
 
+console.log('Frontend JS Version: 3.0 - NO THINKING MESSAGE');
+
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
     loadSettings();
@@ -150,19 +152,17 @@ function handleKeyPress(event) {
 async function askQuestion() {
     const input = document.getElementById('questionInput');
     const question = input.value.trim();
-    
+
     if (!question) return;
-    
+
     if (!API_URL) {
         addMessage('error', 'Please configure your API URL in Settings first!');
         return;
     }
-    
-    addMessage('user', question);
+
+    addMessage('user', `<strong>You:</strong> ${question}`);
     input.value = '';
-    
-    const loadingId = addMessage('bot', '<span class="loading"></span> Thinking...');
-    
+
     try {
         const response = await fetch(`${API_URL}/api/chat`, {
             method: 'POST',
@@ -171,19 +171,16 @@ async function askQuestion() {
             },
             body: JSON.stringify({ question: question })
         });
-        
+
         const data = await response.json();
-        
-        removeMessage(loadingId);
-        
+
         if (data.answer) {
             addMessage('bot', `<strong>Bot:</strong> ${data.answer}`);
         } else {
             addMessage('error', 'No response received from the API');
         }
-        
+
     } catch (error) {
-        removeMessage(loadingId);
         addMessage('error', `Error: ${error.message}`);
     }
 }
