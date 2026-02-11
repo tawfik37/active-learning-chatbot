@@ -16,5 +16,5 @@ pip install -r requirements.txt
 echo ""
 echo "Environment setup complete!"
 echo "=================================================="
-echo "Next step: Run ./start_pipeline.sh"
+echo "Next step: python run.py all"
 echo "=================================================="
