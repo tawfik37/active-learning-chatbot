@@ -1,253 +1,106 @@
-# 🚀 Active Learning Chatbot - Complete Deployment Guide
+# Deployment Guide
 
-This guide covers deploying your chatbot to Modal with a production-ready web interface.
+Deploy the Active Learning Chatbot to Modal with a production-ready web interface.
 
-## 📋 Table of Contents
-1. [Prerequisites](#prerequisites)
-2. [Detailed Deployment Steps](#detailed-deployment-steps)
-3. [Frontend Setup & Customization](#frontend-setup--customization)
-4. [Starting & Stopping Your App](#starting--stopping-your-app)
-5. [Testing Your Deployment](#testing-your-deployment)
+## Prerequisites
 
----
+- Python 3.8+
+- Google API credentials (API Key + Custom Search Engine ID)
+- Modal account ([modal.com](https://modal.com))
 
-## 📝 Prerequisites
+## Setup
 
-Before deploying, ensure you have:
-
-- **Python 3.8+** installed
-- **Google API credentials** (API Key + Custom Search Engine ID)
-- **Git** for version control
-- **Modal account** (free to sign up)
-- **Trained model** (at least one fine-tuned version or base model)
-
----
-
-## 📝 Detailed Deployment Steps
-
-### **Step 1: Install Modal**
+### 1. Install and authenticate Modal
 
 ```bash
-# Install Modal CLI
 pip install modal
-```
-
-**Verify installation:**
-```bash
-modal --version
-```
-
-### **Step 2: Authenticate with Modal**
-
-```bash
 modal setup
 ```
 
-**What happens:**
-1. Opens your browser automatically
-2. Sign up/login with GitHub, Google, or email
-3. Authorize the connection
-4. Terminal shows: "Successfully authenticated!"
-
-**To verify:**
-```bash
-modal profile current
-```
-
----
-
-### **Step 3: Store API Keys in Modal Secrets**
+### 2. Store API keys as Modal secrets
 
 ```bash
 modal secret create google-api-credentials \
-  GOOGLE_API_KEY=AIza... \
-  GOOGLE_CSE_ID=abc123def456:xyz789
+  GOOGLE_API_KEY=your-key \
+  GOOGLE_CSE_ID=your-cse-id
 ```
 
-**To verify:**
-```bash
-modal secret list
-```
-
-You should see: `google-api-credentials`
-
----
-
-### **Step 4: Create Storage Volume**
+### 3. Create storage volume
 
 ```bash
 modal volume create chatbot-models
 ```
 
-**To verify:**
-```bash
-modal volume list
-```
-
-You should see: `chatbot-models`
-
----
-
-### **Step 5: Deploy Your App**
-
-Navigate to the deployment directory:
+### 4. Deploy
 
 ```bash
-cd deployment/modal
+./deployment/modal/deploy.sh
 ```
 
-#### **For Testing (Development Mode):**
+Choose:
+- **Option 1** -- Production (permanent URL)
+- **Option 2** -- Development (temporary URL, auto-reloads on changes)
+
+## Architecture
+
+```
+Modal Cloud
+├── FastAPI Web Server (T4 GPU)
+│   ├── POST /api/chat         Chat endpoint
+│   ├── GET  /api/health       Status check
+│   ├── GET  /api/model/current  Current model version
+│   ├── POST /api/model/reset  Reset to base model
+│   └── /                      Serves frontend/
+├── Training Job (A10G GPU)
+│   └── Triggered after 10 cycles if score <= 5/10
+└── Persistent Volume (chatbot-models)
+    ├── qwen-finetuned-v1/
+    ├── qwen-finetuned-v2/
+    ├── _latest_model_config.json
+    └── data_for_finetuning.jsonl
+```
+
+## Testing
+
+### Manual testing
 
 ```bash
-./deploy.sh
-# Choose option: 2
-```
+# Health check
+curl https://your-url.modal.run/api/health
 
-**You'll see:**
-```
-✓ Created web function fastapi_app => https://your-url-dev.modal.run
-⚡️ Serving... hit Ctrl-C to stop!
-```
-
-**Important Notes:**
-- Copy your URL! This is your API endpoint
-- The URL changes each time you restart
-- Frontend is served at the root URL
-- API endpoints are at `/api/*`
-
-#### **For Production (Permanent Deployment):**
-
-```bash
-./deploy.sh
-# Choose option: 1
-```
-
-**You'll see:**
-```
-✓ Deployed web function fastapi_app => https://your-url.modal.run
-```
-
-**Important Notes:**
-- This URL is permanent and won't change
-- Perfect for production use
-- Frontend and API both accessible
-- Runs continuously until stopped
-
----
-
-## 🎨 Frontend Setup & Customization
-
-The web interface is located in `deployment/frontend/` and includes:
-
-### **Files:**
-- `index.html` - Main UI structure
-- `app.js` - Frontend logic and API communication
-- `style.css` - Styling and theming
-
----
-
-## 🧪 Testing Your Deployment
-
-After deploying, test your application:
-
-### **Option 1: Using the Test Script**
-
-```bash
-cd deployment/modal
-python test_deployment.py
-```
-
-This will:
-- Test the `/health` endpoint
-- Check model version info
-- Send a test chat message
-- Verify response format
-
-### **Option 2: Manual Testing**
-
-**Test the API:**
-```bash
-# Replace with your Modal URL
-curl https://your-url.modal.run/health
-
-# Test chat endpoint
+# Chat
 curl -X POST https://your-url.modal.run/api/chat \
   -H "Content-Type: application/json" \
   -d '{"question": "What is the capital of France?"}'
+
+# Reset to base model
+curl -X POST https://your-url.modal.run/api/model/reset
 ```
 
-**Test the Frontend:**
-1. Open your Modal URL in a browser
-2. You should see the chat interface
-3. Try asking a question
-4. Check browser console (F12) for any errors
+## Managing the App
 
----
-
-## 🔄 Starting & Stopping Your App
-
-### **Option 1: Development Mode (Temporary URL)**
-
-#### ⏹️ **To STOP:**
-Press `Ctrl+C` in the terminal where it's running.
-
-#### ▶️ **To START AGAIN:**
 ```bash
-cd deployment/modal
-./deploy.sh
-# Choose option: 2
-```
-
-**Note:** You'll get a **NEW URL** each time you restart in dev mode.
-
----
-
-### **Option 2: Production Mode (Permanent URL)**
-
-#### ⏹️ **To STOP:**
-```bash
+# Stop
 modal app stop active-learning-chatbot
-```
 
-#### ▶️ **To START AGAIN:**
-```bash
-cd deployment/modal
-./deploy.sh
-# Choose option: 1
-```
-
-**Your URL stays the same!**
-
----
-
-### **Option 3: Check If App Is Running**
-
-```bash
-# List all running apps
-modal app list
-
-# Check specific app status
-modal app logs active-learning-chatbot
-
-# View real-time logs
+# View logs
 modal app logs active-learning-chatbot --follow
+
+# List volume contents
+modal volume ls chatbot-models
+
+# Reset to base model (delete config from volume)
+modal volume rm chatbot-models _latest_model_config.json
 ```
 
----
-
-### **File Structure**
+## File Structure
 
 ```
 deployment/
-├── frontend/           # Web UI files (served by Modal)
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-├── modal/             # Modal deployment files
-│   ├── modal_app.py   # Main application
-│   ├── deploy.sh      # Deployment script
-│   ├── upload_model.py
-│   └── test_deployment.py
-└── README.md          # This file
+├── modal/
+│   ├── modal_app.py        # Main FastAPI app with model serving
+│   ├── deploy.sh           # Interactive deployment script
+│   ├── upload_model.py     # Upload trained models to volume
+│   └── test_deployment.py  # API endpoint tests
+└── README.md               # This file
 ```
-
