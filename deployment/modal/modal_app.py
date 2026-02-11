@@ -42,7 +42,7 @@ image = (
     # MOUNT LOCAL DIRECTORIES
     .add_local_dir("src", REMOTE_SRC_PATH)
     .add_local_dir("config", REMOTE_CONFIG_PATH)
-    .add_local_dir("deployment/frontend", REMOTE_FRONTEND_PATH)
+    .add_local_dir("frontend", REMOTE_FRONTEND_PATH)
 )
 
 # ============================================================================
