@@ -451,6 +451,18 @@ async def health():
 async def model_info():
     return {"model_path": "current", "is_base_model": False}
 
+@web_app.post("/api/model/reset")
+async def reset_model():
+    """Delete the config file so the next container starts with the base model."""
+    import os, json
+    config_file = os.path.join(VOLUME_MOUNT_PATH, "_latest_model_config.json")
+    data_file = os.path.join(VOLUME_MOUNT_PATH, "data_for_finetuning.jsonl")
+    for f in [config_file, data_file]:
+        if os.path.exists(f):
+            os.remove(f)
+    volume.commit()
+    return {"status": "reset", "message": "Config cleared. Redeploy or wait for container restart to load base model."}
+
 from fastapi.staticfiles import StaticFiles
 web_app.mount("/", StaticFiles(directory="/root/frontend", html=True, check_dir=False))
 
